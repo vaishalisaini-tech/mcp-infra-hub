@@ -4,6 +4,7 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import json
 
 load_dotenv()
 
@@ -35,13 +36,12 @@ def get_db_connection():
 
 @app.get("/api/audit")
 def get_audit_logs(limit: int = 50):
-    """Return the most recent audit rows for the dashboard feed."""
     conn = get_db_connection()
     with conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT id, tool_name, action_type, arguments, status,
-                   old_value, new_value, called_at
+                   result, user_prompt, old_value, new_value, called_at
             FROM audit_log
             ORDER BY id DESC
             LIMIT %s
@@ -52,17 +52,42 @@ def get_audit_logs(limit: int = 50):
     conn.close()
     return {"count": len(rows), "logs": rows}
 
+
 @app.get("/api/stats")
 def get_stats():
-    """Aggregate counts for dashboard summary cards."""
     conn = get_db_connection()
     with conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS total FROM audit_log;")
-        total = cur.fetchone()["total"]
-        cur.execute("""
-            SELECT status, COUNT(*) AS n FROM audit_log GROUP BY status;
-        """)
-        by_status = cur.fetchall()
+        cur.execute("SELECT status, COUNT(*) AS n FROM audit_log GROUP BY status;")
+        rows = cur.fetchall()
     conn.close()
-    return {"total_actions": total, "by_status": by_status}
+    counts = {r["status"]: r["n"] for r in rows}
+    return {
+        "total":     sum(counts.values()),
+        "executed":  counts.get("executed", 0),
+        "pending":   counts.get("pending_confirmation", 0),
+        "failed":    counts.get("failed", 0),
+        "reads":     counts.get("success", 0),
+    }
+
+
+@app.get("/api/health")
+def get_health():
+    conn = get_db_connection()
+    with conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT result FROM audit_log
+            WHERE tool_name = 'get_gke_cluster_status' AND status = 'success'
+            ORDER BY id DESC LIMIT 1;
+        """)
+        row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"known": False}
+    try:
+        data = json.loads(row["result"])
+        c = (data.get("clusters") or [{}])[0]
+        return {"known": True, "status": c.get("status"), "nodes": c.get("node_count"),
+                "name": c.get("name"), "location": c.get("location")}
+    except Exception:
+        return {"known": False}
 
